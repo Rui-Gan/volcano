@@ -72,22 +72,24 @@ type Session struct {
 	Configurations []conf.Configuration
 	NodeList       []*api.NodeInfo
 
-	plugins           map[string]Plugin
-	eventHandlers     []*EventHandler
-	jobOrderFns       map[string]api.CompareFn
-	queueOrderFns     map[string]api.CompareFn
-	taskOrderFns      map[string]api.CompareFn
-	clusterOrderFns   map[string]api.CompareFn
-	predicateFns      map[string]api.PredicateFn
-	prePredicateFns   map[string]api.PrePredicateFn
-	bestNodeFns       map[string]api.BestNodeFn
-	nodeOrderFns      map[string]api.NodeOrderFn
-	batchNodeOrderFns map[string]api.BatchNodeOrderFn
-	nodeMapFns        map[string]api.NodeMapFn
-	nodeReduceFns     map[string]api.NodeReduceFn
-	preemptableFns    map[string]api.EvictableFn
-	reclaimableFns    map[string]api.EvictableFn
-	overusedFns       map[string]api.ValidateFn
+	plugins            map[string]Plugin
+	eventHandlers      []*EventHandler
+	jobOrderFns        map[string]api.CompareFn
+	queueOrderFns      map[string]api.CompareFn
+	taskOrderFns       map[string]api.CompareFn
+	victimJobOrderFns  map[string]api.VictimCompareFn
+	victimTaskOrderFns map[string]api.VictimCompareFn
+	clusterOrderFns    map[string]api.CompareFn
+	predicateFns       map[string]api.PredicateFn
+	prePredicateFns    map[string]api.PrePredicateFn
+	bestNodeFns        map[string]api.BestNodeFn
+	nodeOrderFns       map[string]api.NodeOrderFn
+	batchNodeOrderFns  map[string]api.BatchNodeOrderFn
+	nodeMapFns         map[string]api.NodeMapFn
+	nodeReduceFns      map[string]api.NodeReduceFn
+	preemptableFns     map[string]api.EvictableFn
+	reclaimableFns     map[string]api.EvictableFn
+	overusedFns        map[string]api.ValidateFn
 	// preemptiveFns means whether current queue can reclaim from other queue,
 	// while reclaimableFns means whether current queue's resources can be reclaimed.
 	preemptiveFns     map[string]api.ValidateFn
@@ -203,6 +205,11 @@ func updateQueueStatus(ssn *Session) {
 	for _, job := range ssn.Jobs {
 		for _, runningTask := range job.TaskStatusIndex[api.Running] {
 			allocatedResources[job.Queue].Add(runningTask.Resreq)
+			if queueInfo, exist := ssn.Queues[job.Queue]; exist {
+				if len(queueInfo.Queue.Spec.Parent) != 0 {
+					allocatedResources[api.QueueID(queueInfo.Queue.Spec.Parent)].Add(runningTask.Resreq)
+				}
+			}
 		}
 	}
 

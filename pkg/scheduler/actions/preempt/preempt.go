@@ -253,7 +253,7 @@ func preempt(
 			continue
 		}
 
-		victimsQueue := ssn.BuildVictimsPriorityQueue(victims)
+		victimsQueue := ssn.BuildVictimsPriorityQueue(victims, preemptor)
 		// Preempt victims for tasks, pick lowest priority task first.
 		preempted := api.EmptyResource()
 
