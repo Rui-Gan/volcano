@@ -45,6 +45,16 @@ func (ssn *Session) AddTaskOrderFn(name string, cf api.CompareFn) {
 	ssn.taskOrderFns[name] = cf
 }
 
+// AddVictimJobOrderFn add victimjoborder function
+func (ssn *Session) AddVictimJobOrderFn(name string, vcf api.VictimCompareFn) {
+	ssn.victimJobOrderFns[name] = vcf
+}
+
+// AddVictimTaskOrderFn add victimtaskorder function
+func (ssn *Session) AddVictimTaskOrderFn(name string, vcf api.VictimCompareFn) {
+	ssn.victimTaskOrderFns[name] = vcf
+}
+
 // AddPreemptableFn add preemptable function
 func (ssn *Session) AddPreemptableFn(name string, cf api.EvictableFn) {
 	ssn.preemptableFns[name] = cf
@@ -545,6 +555,23 @@ func (ssn *Session) JobOrderFn(l, r interface{}) bool {
 	return lv.CreationTimestamp.Before(&rv.CreationTimestamp)
 }
 
+// VictimJobOrderFn invoke victimjoborder function of the plugins
+func (ssn *Session) VictimJobOrderFn(l, r, preemptor interface{}) bool {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			jof, found := ssn.victimJobOrderFns[plugin.Name]
+			if !found {
+				continue
+			}
+			if j := jof(l, r, preemptor); j != 0 {
+				return j < 0
+			}
+		}
+	}
+
+	return !ssn.JobOrderFn(l, r)
+}
+
 // ClusterOrderFn invoke ClusterOrderFn function of the plugins
 func (ssn *Session) ClusterOrderFn(l, r interface{}) bool {
 	for _, tier := range ssn.Tiers {
@@ -624,6 +651,23 @@ func (ssn *Session) TaskOrderFn(l, r interface{}) bool {
 	lv := l.(*api.TaskInfo)
 	rv := r.(*api.TaskInfo)
 	return helpers.CompareTask(lv, rv)
+}
+
+// VictimTaskOrderFn invoke victimtaskorder function of the plugins
+func (ssn *Session) VictimTaskOrderFn(l, r, preemptor interface{}) bool {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			tof, found := ssn.victimJobOrderFns[plugin.Name]
+			if !found {
+				continue
+			}
+			if j := tof(l, r, preemptor); j != 0 {
+				return j < 0
+			}
+		}
+	}
+
+	return !ssn.TaskOrderFn(l, r)
 }
 
 // PredicateFn invoke predicate function of the plugins
@@ -793,14 +837,14 @@ func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map
 // BuildVictimsPriorityQueue returns a priority queue with victims sorted by:
 // if victims has same job id, sorted by !ssn.TaskOrderFn
 // if victims has different job id, sorted by !ssn.JobOrderFn
-func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo) *util.PriorityQueue {
+func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor *api.TaskInfo) *util.PriorityQueue {
 	victimsQueue := util.NewPriorityQueue(func(l, r interface{}) bool {
 		lv := l.(*api.TaskInfo)
 		rv := r.(*api.TaskInfo)
 		if lv.Job == rv.Job {
-			return !ssn.TaskOrderFn(l, r)
+			return ssn.VictimTaskOrderFn(l, r, preemptor)
 		}
-		return !ssn.JobOrderFn(ssn.Jobs[lv.Job], ssn.Jobs[rv.Job])
+		return ssn.VictimJobOrderFn(ssn.Jobs[lv.Job], ssn.Jobs[rv.Job], preemptor)
 	})
 	for _, victim := range victims {
 		victimsQueue.Push(victim)

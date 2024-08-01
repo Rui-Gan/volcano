@@ -161,6 +161,16 @@ func validateHierarchicalAttributes(queue *schedulingv1beta1.Queue, fldPath *fie
 			}
 		}
 	}
+
+	if queue.Spec.Parent != "" {
+		_, err := config.VolcanoClient.SchedulingV1beta1().Queues().Get(context.TODO(), queue.Spec.Parent, metav1.GetOptions{})
+		if err != nil {
+			return append(errs, field.Invalid(fldPath, queue.Spec.Parent,
+				fmt.Sprintf("checking parent queue, get parent queue failed: %v",
+					err,
+				)))
+		}
+	}
 	return errs
 }
 

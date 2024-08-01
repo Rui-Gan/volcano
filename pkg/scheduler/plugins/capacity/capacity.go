@@ -38,6 +38,8 @@ type capacityPlugin struct {
 	totalResource  *api.Resource
 	totalGuarantee *api.Resource
 
+	rootQueue api.QueueID
+
 	queueOpts map[api.QueueID]*queueAttr
 	// Arguments given for the plugin
 	pluginArguments framework.Arguments
@@ -47,6 +49,9 @@ type queueAttr struct {
 	queueID api.QueueID
 	name    string
 	share   float64
+
+	parents  []api.QueueID
+	children map[api.QueueID]*queueAttr
 
 	deserved  *api.Resource
 	allocated *api.Resource
@@ -61,6 +66,25 @@ type queueAttr struct {
 	guarantee      *api.Resource
 }
 
+func (qa *queueAttr) Clone() *queueAttr {
+	return &queueAttr{
+		queueID:  qa.queueID,
+		name:     qa.name,
+		share:    qa.share,
+		parents:  qa.parents,
+		children: qa.children,
+
+		allocated:      qa.allocated.Clone(),
+		request:        qa.request.Clone(),
+		guarantee:      qa.guarantee.Clone(),
+		deserved:       qa.deserved.Clone(),
+		inqueue:        qa.inqueue.Clone(),
+		elastic:        qa.elastic.Clone(),
+		capability:     qa.capability.Clone(),
+		realCapability: qa.realCapability.Clone(),
+	}
+}
+
 // New return capacityPlugin action
 func New(arguments framework.Arguments) framework.Plugin {
 	return &capacityPlugin{
@@ -69,6 +93,19 @@ func New(arguments framework.Arguments) framework.Plugin {
 		queueOpts:       map[api.QueueID]*queueAttr{},
 		pluginArguments: arguments,
 	}
+}
+
+// HierarchyEnabled returns if hierarchy is enabled
+func (cp *capacityPlugin) HierarchyEnabled(ssn *framework.Session) bool {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if plugin.Name != PluginName {
+				continue
+			}
+			return plugin.EnabledHierarchy != nil && *plugin.EnabledHierarchy
+		}
+	}
+	return false
 }
 
 func (cp *capacityPlugin) Name() string {
@@ -80,6 +117,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	cp.totalResource.Add(ssn.TotalResource)
 
 	klog.V(4).Infof("The total resource is <%v>", cp.totalResource)
+
 	for _, queue := range ssn.Queues {
 		if len(queue.Queue.Spec.Guarantee.Resource) == 0 {
 			continue
@@ -88,40 +126,22 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		cp.totalGuarantee.Add(guarantee)
 	}
 	klog.V(4).Infof("The total guarantee resource is <%v>", cp.totalGuarantee)
+
+	hierarchyEnabled := cp.HierarchyEnabled(ssn)
+	if hierarchyEnabled {
+		rootAttr := cp.newQueueAttr(ssn.Queues[cp.rootQueue])
+		cp.queueOpts[cp.rootQueue] = rootAttr
+	}
+
 	// Build attributes for Queues.
 	for _, job := range ssn.Jobs {
 		klog.V(4).Infof("Considering Job <%s/%s>.", job.Namespace, job.Name)
 		if _, found := cp.queueOpts[job.Queue]; !found {
 			queue := ssn.Queues[job.Queue]
-			attr := &queueAttr{
-				queueID: queue.UID,
-				name:    queue.Name,
+			attr := cp.newQueueAttr(queue)
 
-				deserved:  api.NewResource(queue.Queue.Spec.Deserved),
-				allocated: api.EmptyResource(),
-				request:   api.EmptyResource(),
-				elastic:   api.EmptyResource(),
-				inqueue:   api.EmptyResource(),
-				guarantee: api.EmptyResource(),
-			}
-			if len(queue.Queue.Spec.Capability) != 0 {
-				attr.capability = api.NewResource(queue.Queue.Spec.Capability)
-				if attr.capability.MilliCPU <= 0 {
-					attr.capability.MilliCPU = math.MaxFloat64
-				}
-				if attr.capability.Memory <= 0 {
-					attr.capability.Memory = math.MaxFloat64
-				}
-			}
-			if len(queue.Queue.Spec.Guarantee.Resource) != 0 {
-				attr.guarantee = api.NewResource(queue.Queue.Spec.Guarantee.Resource)
-			}
-			realCapability := cp.totalResource.Clone().Sub(cp.totalGuarantee).Add(attr.guarantee)
-			if attr.capability == nil {
-				attr.realCapability = realCapability
-			} else {
-				realCapability.MinDimensionResource(attr.capability, api.Infinity)
-				attr.realCapability = realCapability
+			if hierarchyEnabled {
+				cp.updateQueueChildInfo(attr, queue, ssn)
 			}
 			cp.queueOpts[job.Queue] = attr
 			klog.V(4).Infof("Added Queue <%s> attributes.", job.Queue)
@@ -160,6 +180,22 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	}
 
 	for _, attr := range cp.queueOpts {
+		oldAttr := &queueAttr{
+			queueID:  attr.queueID,
+			name:     attr.name,
+			share:    attr.share,
+			parents:  attr.parents,
+			children: attr.children,
+
+			deserved:       api.EmptyResource(),
+			allocated:      api.EmptyResource(),
+			request:        api.EmptyResource(),
+			elastic:        api.EmptyResource(),
+			inqueue:        api.EmptyResource(),
+			capability:     api.EmptyResource(),
+			realCapability: api.EmptyResource(),
+			guarantee:      api.EmptyResource(),
+		}
 		if attr.realCapability != nil {
 			attr.deserved.MinDimensionResource(attr.realCapability, api.Infinity)
 		}
@@ -168,6 +204,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		attr.deserved = helpers.Max(attr.deserved, attr.guarantee)
 		cp.updateShare(attr)
+		if hierarchyEnabled {
+			cp.updateParentQueue(oldAttr, attr)
+		}
 		klog.V(4).Infof("The attributes of queue <%s> in capacity: deserved <%v>, realCapability <%v>, allocate <%v>, request <%v>, elastic <%v>, share <%0.2f>",
 			attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.request, attr.elastic, attr.share)
 	}
@@ -199,7 +238,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		metrics.UpdateQueuePodGroupUnknownCount(queueInfo.Name, 0)
 	}
 
-	ssn.AddQueueOrderFn(cp.Name(), func(l, r interface{}) int {
+	queueOrderFn := func(l, r interface{}) int {
 		lv := l.(*api.QueueInfo)
 		rv := r.(*api.QueueInfo)
 
@@ -212,7 +251,88 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		return 1
-	})
+	}
+
+	if hierarchyEnabled {
+		queueOrderFn = func(l, r interface{}) int {
+			lv := l.(*api.QueueInfo)
+			rv := r.(*api.QueueInfo)
+			lvLeaf := cp.isLeafQueue(lv.UID)
+			rvLeaf := cp.isLeafQueue(rv.UID)
+
+			if lvLeaf && !rvLeaf {
+				return -1
+			} else if !lvLeaf && rvLeaf {
+				return 1
+			}
+
+			lvAttr := cp.queueOpts[lv.UID]
+			rvAttr := cp.queueOpts[rv.UID]
+			lvParentID := lvAttr.queueID
+			rvParentID := rvAttr.queueID
+			level := getQueueLevel(lvAttr, rvAttr)
+			if level < len(lvAttr.parents) {
+				lvParentID = lvAttr.parents[level]
+			}
+			if level < len(rvAttr.parents) {
+				rvParentID = rvAttr.parents[level]
+			}
+
+			if cp.queueOpts[lvParentID].share == cp.queueOpts[rvParentID].share {
+				return 0
+			}
+
+			if cp.queueOpts[lvParentID].share < cp.queueOpts[rvParentID].share {
+				return -1
+			}
+
+			return 1
+		}
+
+		ssn.AddVictimJobOrderFn(cp.Name(), func(l, r, preemptor interface{}) int {
+			lv := l.(*api.JobInfo)
+			rv := r.(*api.JobInfo)
+			pv := preemptor.(*api.JobInfo)
+
+			lLevel := getQueueLevel(cp.queueOpts[lv.Queue], cp.queueOpts[pv.Queue])
+			rLevel := getQueueLevel(cp.queueOpts[rv.Queue], cp.queueOpts[pv.Queue])
+
+			if lLevel == rLevel {
+				return 0
+			}
+
+			if lLevel > rLevel {
+				return -1
+			}
+
+			return 1
+		})
+
+		ssn.AddVictimTaskOrderFn(cp.Name(), func(l, r, preemptor interface{}) int {
+			lv := l.(*api.TaskInfo)
+			rv := r.(*api.TaskInfo)
+			pv := preemptor.(*api.TaskInfo)
+
+			lJob := ssn.Jobs[lv.Job]
+			rJob := ssn.Jobs[rv.Job]
+			pJob := ssn.Jobs[pv.Job]
+
+			lLevel := getQueueLevel(cp.queueOpts[lJob.Queue], cp.queueOpts[pJob.Queue])
+			rLevel := getQueueLevel(cp.queueOpts[rJob.Queue], cp.queueOpts[pJob.Queue])
+
+			if lLevel == rLevel {
+				return 0
+			}
+
+			if lLevel > rLevel {
+				return -1
+			}
+
+			return 1
+		})
+	}
+
+	ssn.AddQueueOrderFn(cp.Name(), queueOrderFn)
 
 	ssn.AddReclaimableFn(cp.Name(), func(reclaimer *api.TaskInfo, reclaimees []*api.TaskInfo) ([]*api.TaskInfo, int) {
 		var victims []*api.TaskInfo
@@ -260,6 +380,11 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddAllocatableFn(cp.Name(), func(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+		if hierarchyEnabled {
+			if !cp.isLeafQueue(queue.UID) {
+				return false
+			}
+		}
 		attr := cp.queueOpts[queue.UID]
 
 		free, _ := attr.realCapability.Diff(attr.allocated, api.Zero)
@@ -317,10 +442,14 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		AllocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
+			oldAttr := attr.Clone()
 			attr.allocated.Add(event.Task.Resreq)
 			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
 
 			cp.updateShare(attr)
+			if hierarchyEnabled {
+				cp.updateParentQueue(oldAttr, attr)
+			}
 
 			klog.V(4).Infof("Capacity AllocateFunc: task <%v/%v>, resreq <%v>,  share <%v>",
 				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
@@ -328,10 +457,14 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		DeallocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
+			oldAttr := attr.Clone()
 			attr.allocated.Sub(event.Task.Resreq)
 			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
 
 			cp.updateShare(attr)
+			if hierarchyEnabled {
+				cp.updateParentQueue(oldAttr, attr)
+			}
 
 			klog.V(4).Infof("Capacity EvictFunc: task <%v/%v>, resreq <%v>,  share <%v>",
 				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
@@ -357,4 +490,111 @@ func (cp *capacityPlugin) updateShare(attr *queueAttr) {
 
 	attr.share = res
 	metrics.UpdateQueueShare(attr.name, attr.share)
+}
+
+func (cp *capacityPlugin) newQueueAttr(queue *api.QueueInfo) *queueAttr {
+	attr := &queueAttr{
+		queueID:  queue.UID,
+		name:     queue.Name,
+		parents:  make([]api.QueueID, 0),
+		children: make(map[api.QueueID]*queueAttr),
+
+		deserved:  api.NewResource(queue.Queue.Spec.Deserved),
+		allocated: api.EmptyResource(),
+		request:   api.EmptyResource(),
+		elastic:   api.EmptyResource(),
+		inqueue:   api.EmptyResource(),
+		guarantee: api.EmptyResource(),
+	}
+
+	if len(queue.Queue.Spec.Capability) != 0 {
+		attr.capability = api.NewResource(queue.Queue.Spec.Capability)
+		if attr.capability.MilliCPU <= 0 {
+			attr.capability.MilliCPU = math.MaxFloat64
+		}
+		if attr.capability.Memory <= 0 {
+			attr.capability.Memory = math.MaxFloat64
+		}
+	}
+
+	if len(queue.Queue.Spec.Guarantee.Resource) != 0 {
+		attr.guarantee = api.NewResource(queue.Queue.Spec.Guarantee.Resource)
+	}
+	realCapability := cp.totalResource.Clone().Sub(cp.totalGuarantee).Add(attr.guarantee)
+	if attr.capability == nil {
+		attr.realCapability = realCapability
+	} else {
+		realCapability.MinDimensionResource(attr.capability, api.Infinity)
+		attr.realCapability = realCapability
+	}
+	return attr
+}
+
+func (cp *capacityPlugin) updateQueueChildInfo(attr *queueAttr, queue *api.QueueInfo, ssn *framework.Session) []api.QueueID {
+	if attr.queueID == cp.rootQueue {
+		return []api.QueueID{attr.queueID}
+	}
+
+	parentID := cp.rootQueue
+	if len(queue.Queue.Spec.Parent) != 0 {
+		parentID = api.QueueID(queue.Queue.Spec.Parent)
+	}
+
+	parentQueue := ssn.Queues[parentID]
+	if _, exist := cp.queueOpts[parentID]; !exist {
+		cp.queueOpts[parentID] = cp.newQueueAttr(parentQueue)
+	}
+	parentAttr := cp.queueOpts[parentID]
+	if _, exist := parentAttr.children[attr.queueID]; !exist {
+		parentAttr.children[attr.queueID] = attr
+	}
+	attr.parents = cp.updateQueueChildInfo(parentAttr, parentQueue, ssn)
+	return append(attr.parents, attr.queueID)
+}
+
+func (cp *capacityPlugin) updateParentQueue(oldAttr *queueAttr, newAttr *queueAttr) {
+	diffAttr := calculateDiffAttr(oldAttr, newAttr)
+	for _, parentID := range newAttr.parents {
+		if parentAttr, exist := cp.queueOpts[parentID]; exist {
+			parentAttr.allocated.Add(diffAttr.allocated)
+			parentAttr.request.Add(diffAttr.request)
+			parentAttr.deserved.Add(diffAttr.deserved)
+			parentAttr.inqueue.Add(diffAttr.inqueue)
+			parentAttr.guarantee.Add(diffAttr.guarantee)
+			parentAttr.elastic.Add(diffAttr.elastic)
+			parentAttr.capability.Add(diffAttr.capability)
+			parentAttr.realCapability.Add(diffAttr.realCapability)
+			cp.updateShare(parentAttr)
+		}
+	}
+}
+
+func (cp *capacityPlugin) isLeafQueue(queueID api.QueueID) bool {
+	return len(cp.queueOpts[queueID].children) == 0
+}
+
+func calculateDiffAttr(oldAttr *queueAttr, newAttr *queueAttr) *queueAttr {
+	diffAttr := newAttr.Clone()
+	diffAttr.allocated = newAttr.allocated.SubWithoutAssert(oldAttr.allocated)
+	diffAttr.request = newAttr.request.SubWithoutAssert(oldAttr.request)
+	diffAttr.guarantee = newAttr.guarantee.SubWithoutAssert(oldAttr.guarantee)
+	diffAttr.deserved = newAttr.deserved.SubWithoutAssert(oldAttr.deserved)
+	diffAttr.inqueue = newAttr.inqueue.SubWithoutAssert(oldAttr.inqueue)
+	diffAttr.elastic = newAttr.elastic.SubWithoutAssert(oldAttr.elastic)
+	diffAttr.capability = newAttr.capability.SubWithoutAssert(oldAttr.capability)
+	diffAttr.realCapability = newAttr.realCapability.SubWithoutAssert(oldAttr.realCapability)
+
+	return diffAttr
+}
+
+func getQueueLevel(l *queueAttr, r *queueAttr) int {
+	level := min(len(l.parents), len(r.parents))
+
+	for i := 0; i < level; i++ {
+		if l.parents[i] != r.parents[i] {
+			return i
+		}
+	}
+
+	return level
 }
