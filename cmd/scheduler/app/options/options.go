@@ -33,6 +33,7 @@ const (
 	defaultSchedulerName   = "volcano"
 	defaultSchedulerPeriod = time.Second
 	defaultQueue           = "default"
+	rootQueue              = ""
 	defaultListenAddress   = ":8080"
 	defaultHealthzAddress  = ":11251"
 	defaultPluginsDir      = ""
@@ -65,6 +66,7 @@ type ServerOption struct {
 	// Deprecated: use ResourceNamespace instead.
 	LockObjectNamespace string
 	DefaultQueue        string
+	RootQueue           string
 	PrintVersion        bool
 	EnableMetrics       bool
 	ListenAddress       string
@@ -119,6 +121,7 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&s.SchedulerConf, "scheduler-conf", "", "The absolute path of scheduler configuration file")
 	fs.DurationVar(&s.SchedulePeriod, "schedule-period", defaultSchedulerPeriod, "The period between each scheduling cycle")
 	fs.StringVar(&s.DefaultQueue, "default-queue", defaultQueue, "The default queue name of the job")
+	fs.StringVar(&s.RootQueue, "root-queue", rootQueue, "The root queue name of the job")
 	fs.BoolVar(&s.PrintVersion, "version", false, "Show version and quit")
 	fs.StringVar(&s.ListenAddress, "listen-address", defaultListenAddress, "The address to listen on for HTTP requests.")
 	fs.StringVar(&s.HealthzBindAddress, "healthz-address", defaultHealthzAddress, "The address to listen on for the health check server.")

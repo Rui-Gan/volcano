@@ -139,3 +139,7 @@ func Test_capacityPlugin_OnSessionOpen(t *testing.T) {
 		})
 	}
 }
+
+func Test_Hierarchy_capacityPlugin(t *testing.T) {
+
+}

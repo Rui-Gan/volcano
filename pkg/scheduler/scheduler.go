@@ -35,6 +35,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
+	"volcano.sh/volcano/pkg/scheduler/plugins/capacity"
 )
 
 // Scheduler represents a "Volcano Scheduler".
@@ -159,6 +160,18 @@ func (pc *Scheduler) loadSchedulerConf() {
 	if err != nil {
 		klog.Errorf("Scheduler config %s is invalid: %v", config, err)
 		return
+	}
+
+	enableHierarchy := false
+	for _, tier := range plugins {
+		for _, plugin := range tier.Plugins {
+			if plugin.Name == capacity.PluginName && plugin.EnabledHierarchy != nil {
+				enableHierarchy = *plugin.EnabledHierarchy
+			}
+		}
+	}
+	if enableHierarchy {
+
 	}
 
 	pc.mutex.Lock()
