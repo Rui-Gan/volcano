@@ -112,8 +112,14 @@ func ResFloat642Quantity(resName v1.ResourceName, quantity float64) resource.Qua
 	switch resName {
 	case v1.ResourceCPU:
 		resQuantity = resource.NewMilliQuantity(int64(quantity), resource.DecimalSI)
+	case v1.ResourceEphemeralStorage:
+		resQuantity = resource.NewMilliQuantity(int64(quantity), resource.DecimalSI)
 	default:
-		resQuantity = resource.NewQuantity(int64(quantity), resource.BinarySI)
+		if v1helper.IsScalarResourceName(resName) {
+			resQuantity = resource.NewMilliQuantity(int64(quantity), resource.DecimalSI)
+		} else {
+			resQuantity = resource.NewQuantity(int64(quantity), resource.BinarySI)
+		}
 	}
 
 	return *resQuantity
